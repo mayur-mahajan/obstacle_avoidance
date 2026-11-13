@@ -1,0 +1,36 @@
+[project]
+name = "obstacle-avoidance"
+version = "0.1.0"
+description = "Learn VLA training end to end: a simulated mecanum car learns to follow instructions ('drive to the red ball') with smolVLA, by imitation and reinforcement learning"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.15.0",
+    "torchvision==0.29.2",
+    "genesis-world==1.4.6",          # physics simulator + renderer (CUDA on Linux, Metal on Apple Silicon, or CPU)
+    "lerobot[dataset,smolvla]==0.7.0",  # LeRobotDataset v3 format + the smolVLA policy
+    "opencv-python>=4.10",           # windows + keyboard for driving the car (GUI build of OpenCV)
+    "matplotlib>=3.9",
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "pillow>=10",
+    "jupyterlab>=4.2",
+    "ipykernel>=6.29",
+    "nbclient>=0.10",
+    "nbformat>=5.10",
+]
+
+[tool.uv]
+# lerobot pulls in opencv-python-headless; installed next to opencv-python it replaces the GUI build's files and
+# cv2.imshow / waitKey (used by the driving and recording windows) stop working. Never install it.
+override-dependencies = ["opencv-python-headless ; sys_platform == 'never'"]
+
+# NVIDIA GPUs on Linux and Windows: PyTorch built for CUDA 13.4. macOS: the normal PyPI build (with Apple's MPS).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu134", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu134", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
+explicit = true
