@@ -6,11 +6,12 @@ Reward, given after every 0.1 s control step:
     success    +2.5 when the car arrives and stops at the RIGHT object (the episode ends)
     time       -0.01 per step
     crash      -0.1 per step spent touching anything except the goal
-    sight      +0.2 when the goal comes into view, -0.2 when it leaves
+    sight      +0.2 when the goal comes into view, -0.3 when it leaves the picture
 
-"progress" and "sight" are both differences of a quantity (distance, visible-or-not), so over an
-episode they add up to (start - end): driving back and forth or looking away and back cannot farm
-points ("potential-based shaping", Ng et al. 1999).
+"progress" is a difference of a quantity (the distance), so over an episode it adds up to (start - end): driving
+back and forth cannot farm points ("potential-based shaping", Ng et al. 1999). "sight" is almost one too, but losing
+the goal costs a little more than finding it gives back (-0.3 vs +0.2): looking away and back costs 0.1, so it can't
+be farmed either, and drives that keep the goal in view are preferred on purpose.
 The shortest-path distance comes from the simulator's map. Only the scorer uses it, during training;
 the policy never sees it.
 
@@ -40,7 +41,8 @@ class RewardConfig:
     success: float = 2.5
     time: float = -0.01
     crash: float = -0.1
-    sight: float = 0.2
+    sight: float = 0.2            # when the goal comes into view
+    sight_lost: float = -0.3      # when it leaves the picture (one-time; -0.3 + 0.2 = 0.1 net cost per loss)
 
 
 class RewardTracker:
@@ -75,7 +77,8 @@ class RewardTracker:
                  "success": c.success * float(info["success"]),
                  "time": c.time,
                  "crash": c.crash * float(info["collision"]),
-                 "sight": c.sight * (vis - self.vis)}
+                 "sight": c.sight * max(vis - self.vis, 0.0),             # goal came into view
+                 "sight_lost": c.sight_lost * max(self.vis - vis, 0.0)}   # goal left the picture
         self.d, self.vis = d, vis
         for k, v in parts.items():
             self.totals[k] += v
@@ -95,7 +98,7 @@ def random_spec(rng: np.random.Generator, env_cfg=None):
 # -------------------------------------------------------------------------------------------------
 # One simulator per process
 # -------------------------------------------------------------------------------------------------
-def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, layout: dict):
+def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, layout: dict, detail: bool = False):
     from .data import Paraphraser
     from .env import NavEnv
 
@@ -128,7 +131,7 @@ def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, l
         state["level"] = level
         obs, info = env.reset(spec=spec)
         shape, colour = spec.goal[:2]
-        state.update(tracker=RewardTracker(env, info, rcfg), ret=0.0,
+        state.update(tracker=RewardTracker(env, info, rcfg), ret=0.0, path=[], coll=[], seen=bool(info["goal_visible"]),
                      prompt=para(colour, shape) if paraphrase else spec.prompt)
         return obs
 
@@ -143,6 +146,12 @@ def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, l
             for a in arg:
                 obs, term, trunc, info = env.step(a)
                 r = state["tracker"](info)
+                if detail:
+                    state["path"].append([round(float(v), 3) for v in info["pose"]])
+                    if info["collision"]:
+                        state.setdefault("coll", []).append(len(state["path"]) - 1)
+                if info["goal_visible"]:
+                    state["seen"] = True
                 disc_reward += (gamma ** n) * r
                 state["ret"] += r
                 n += 1
@@ -151,7 +160,11 @@ def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, l
                     ep = {"success": bool(info["success"]), "return": state["ret"], "seconds": info["t"] / 10,
                           "collision_steps": info["n_collision_steps"], "goal": env.spec.goal_name,
                           "start_visible": env.spec.start_visible, "lookalike": env.spec.hard_distractors,
-                          "level": state["level"], "parts": dict(state["tracker"].totals)}
+                          "level": state["level"], "parts": dict(state["tracker"].totals),
+                          "goal_visible_end": bool(info["goal_visible"]), "goal_seen": bool(state.get("seen", False)),
+                          "seed": int(env.spec.seed)}
+                    if detail:   # everything needed to draw the drive on the map (carsim.evaluate.plot_room_drives)
+                        ep.update(path=state["path"], prompt=state["prompt"], collisions=state.get("coll", []))
                     break
             final_obs = obs
             if done:
@@ -185,14 +198,15 @@ class ParallelNav:
     """
 
     def __init__(self, n: int, seed: int = 0, reward_cfg: RewardConfig | None = None, gamma: float = 0.99,
-                 paraphrase: bool = True, layout: dict | None = None):
+                 paraphrase: bool = True, layout: dict | None = None, detail: bool = False):
         """layout: changes to the layout dials (EnvConfig fields) for practice drives, e.g.
-        {"p_goal_visible": 0.25, "p_hard_distractor": 0.8}. None/{} = the standard layouts."""
+        {"p_goal_visible": 0.25, "p_hard_distractor": 0.5}. None/{} = the standard layouts.
+        detail: also return each finished drive's path (x, y, yaw every 0.1 s) and prompt (for the test maps)."""
         ctx = mp.get_context("spawn")  # a fresh interpreter per worker: Genesis must not be forked
         self.conns, self.procs = [], []
         for i in range(n):
             a, b = ctx.Pipe()
-            p = ctx.Process(target=_worker, args=(b, seed * 1000 + i, asdict(reward_cfg or RewardConfig()), gamma, paraphrase, dict(layout or {})),
+            p = ctx.Process(target=_worker, args=(b, seed * 1000 + i, asdict(reward_cfg or RewardConfig()), gamma, paraphrase, dict(layout or {}), detail),
                             daemon=True)
             p.start()
             self.conns.append(a)

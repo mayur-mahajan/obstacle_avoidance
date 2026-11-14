@@ -21,7 +21,7 @@ Run them in order; each one saves what the next one needs into `runs/`.
 | 02 | `02_recording_demonstrations` | the LeRobot dataset format, the image↔action pairing check, record a few drives yourself, record **300 scripted drives** (the training data) | 30 min |
 | 03 | `03_preparing_training_data` | split by layout, action chunks, scaling, mirroring (and when not to), prompt paraphrases, the data loader | 10 min |
 | 04 | `04_imitation_training` | how a VLA works (reader + flow-matching action head), feeding the reader correctly, an auxiliary quiz, training **two action heads** (smolVLA's and a car-specific one), driving tests with charts and luck ranges | 2 h |
-| 05 | `05_reinforcement_learning_ppo` | reward design, parallel CPU simulators, making a flow-matching head trainable by PPO, reading RL graphs, comparing RL with imitation | 1 h + |
+| 05 | `05_reinforcement_learning_ppo` | reward design, parallel CPU simulators, making a flow-matching head trainable by PPO, reading RL graphs, comparing RL with imitation | 4 h |
 
 \*On an RTX 4080 SUPER (16 GB) with a 20-core CPU. On an Apple Silicon Mac, notebooks 00–03 are fine; training in
 04–05 runs but is several times slower.
@@ -31,7 +31,35 @@ Run them in order; each one saves what the next one needs into `runs/`.
 Fixed tests, the same drives for every model (`scripts/rl_tests.py`). "Pair" = two objects in view and each layout
 driven twice, asking for each object: a model that ignores the words scores 50%.
 
-*(filled in after the final runs)*
+| | smolVLA's head (seed 0 / 1) | car head (seed 0 / 1) | same recipe, smolVLA's published input format |
+|---|---|---|---|
+| Words test, pair: drove to the asked-for object | **73% / 82%** | **79% / 87%** | 48–60% |
+| Goal behind the car, decoy in front | 87% / 87% | 80% / 80% | 47–73% |
+| One object alone | 93% / 97% | 97% / 97% | 87–97% |
+| Standard test: 128 ordinary rooms | **78% / 70%** | **74% / 74%** | 48–62% |
+| ... goal hidden at the start | 61% / 59% | 59% / 65% | |
+
+Notebook 04 reproduces the seed-0 columns exactly. The two heads are equally good within luck; the input format of the
+reader makes the difference (see below). Still weak: same-colour lookalikes (cube vs cylinder), and in ordinary rooms
+searching for a hidden goal and getting stuck on obstacles, which notebook 05's reinforcement learning practises.
+
+## Results (reinforcement learning, notebook 05)
+
+100 rounds of PPO starting from the car head (seed 0), tested on the same drives:
+
+| | imitation | after RL | luck test |
+|---|---|---|---|
+| Standard test: drives that touched something | 62% | **43%** | p = 0.0004, real |
+| ... seconds touching per drive | 5.0 | **1.9** | |
+| ... failed drives stuck on an obstacle | 16 | **1** | |
+| ... failed drives that saw the goal, then lost it | 7 | 16 | |
+| Standard test: success | 74% | 76% | p = 0.84, luck |
+| Words test, pair: drove to the asked-for object | 79% | 83% | p = 0.43, luck |
+
+RL taught what the demonstrations couldn't (the scripted driver never touched anything, so never showed how to back
+off), without hurting the reading. Success didn't rise because the failures moved: freed from obstacles, the car now
+more often loses sight of the goal and doesn't find it again. With one camera picture at a time it has no memory of
+where the goal was; that is the next limit (notebook 05, section 9.5).
 
 ## Install
 
@@ -85,6 +113,8 @@ runs/              everything the notebooks produce (datasets, caches, checkpoin
    knows from the map teaches "magic"; a driver that searches like a person, and finishes like one, teaches skills.
 4. **Measure luck.** Retraining with another random seed moved scores by up to ~10 points; every comparison in the
    notebooks shows 95% ranges and drive-by-drive sign tests.
+5. **RL fixes what demonstrations can't show, and reveals what's hidden behind it.** Practice with a crash cost taught
+   the car to get off obstacles; that uncovered the next weakness (losing the goal), which a small reward alone did not fix.
 
 ## References
 

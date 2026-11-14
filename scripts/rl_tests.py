@@ -55,7 +55,7 @@ def standard_test(rl, per_env=16, n_envs=8, seed=2026):
     import torch
     from carsim.rl_env import ParallelNav
 
-    venv = ParallelNav(n_envs, seed=0)
+    venv = ParallelNav(n_envs, seed=0, detail=DETAIL is not None)
     venv.reseed(seed)
     imgs, states, prompts = venv.reset()
     per = [[] for _ in range(n_envs)]
@@ -183,13 +183,18 @@ if __name__ == "__main__":
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--bc", required=True, help="imitation checkpoint (notebook 04)")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--detail", default=None, help="also write every drive's path/distances to this json")
+    ap.add_argument("--detail", default=None, help="also write every drive's path (and for the words test the distances) to this json")
     a = ap.parse_args()
     if a.detail:
         DETAIL = []
     t = time.time()
     rl = load_policy(a.ckpt, a.bc)
     out = standard_test(rl) if a.test == "standard" else which_test(rl)
+    if a.test == "standard" and a.detail:   # paths go to the detail file, the scorecard stays small
+        DETAIL = [{**e} for e in out["episodes"]]
+        for e in out["episodes"]:
+            for k in ("path", "prompt", "collisions"):
+                e.pop(k, None)
     out["ckpt"], out["bc"] = a.ckpt, a.bc
     json.dump(out, open(a.out, "w"), indent=1)
     if a.detail:
