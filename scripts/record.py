@@ -292,6 +292,10 @@ def run_human(env, ds, args, rng):
                              [(f'GOAL: "{record.prompt}"', WHITE), (progress, WHITE)],
                              [("READY - drive to start recording", YELLOW, 0.75),
                               ("T: retype prompt   N: other layout", WHITE, 0.6)])
+                    # The sim is paused here, so nothing else updates the 3-D window. Where the viewer has no thread of
+                    # its own (macOS) it only redraws and receives key presses inside update(): without this call the
+                    # window is frozen and ignores the keys in READY.
+                    env.scene.viewer.update(force=True)
                     time.sleep(1 / 30)
                     next_tick = time.perf_counter()
                     continue
@@ -341,6 +345,7 @@ def run_human(env, ds, args, rng):
                 else:
                     lines.append(("failed episodes are not kept - D or N to go on", YELLOW, 0.6))
                 show_fpv(obs["image"], [(f'GOAL: "{record.prompt}"', WHITE), (progress, WHITE)], lines)
+                env.scene.viewer.update(force=True)  # sim paused: keep the 3-D window alive for the K / D keys (macOS)
                 keep, discard = flags.pop("keep"), flags.pop("discard")
                 if (keep and ok) or discard:
                     row = {**s, "source": "human", "kept": bool(keep and ok)}
