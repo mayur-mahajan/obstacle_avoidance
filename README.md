@@ -119,6 +119,17 @@ uv run jupyter lab          # then open notebooks/00_setup_and_first_drive.ipynb
 The device is picked in one place, `carsim/device.py` (`cuda` > `mps` > `cpu`); force one with `CARSIM_DEVICE=cpu`.
 The first run downloads smolVLA (~0.9 GB) and SmolVLM2 from Hugging Face.
 
+## Watch a trained car drive
+
+Notebooks 04–07 each end their results with a "Watch it drive" cell: the notebook's car drives one room in Genesis, and
+a video shows the overhead camera (with the path driven, and for the route cars the server's route) next to the car's
+front camera. Set `LIVE = True` to also open the Genesis 3-D window. From the command line:
+
+```bash
+python scripts/watch_drive.py --car runs/checkpoints/car06_R_long_s0.pt --ppo runs/rl/car07_route_ppo_s0/best.pt \
+    --seed 623600484 --out drive.mp4 --live
+```
+
 ## Repository layout
 
 ```
@@ -139,6 +150,7 @@ scripts/           programs the notebooks start in their own process (driving wi
   overhead_data*.py train_server*.py overhead_frames.py route_frames.py track_frames.py server_route_frames.py
   train_guided.py car06_tests.py route_follow_prep.py           notebook 06's pipeline (each step skipped if done)
   train_guided_ppo.py                                           practice runs from the command line (notebook 07: --route)
+  watch_drive.py                                                watch a trained car drive one room: video, or the live Genesis window (--live)
 assets/            the car model (URDF) and the 300 scripted room layouts (seeds) behind the results
 notebooks/         the course
 runs/              everything the notebooks produce (datasets, caches, checkpoints, test results); not in git

@@ -60,3 +60,35 @@ def draw_episode(spec, ax=None, cfg: EnvConfig | None = None, show_field=False, 
     ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
     ax.set_title(title if title is not None else f'"{spec.prompt}"\n(goal {"visible" if spec.start_visible else "hidden"} at start)', fontsize=9)
     return ax
+
+
+# ------------------------------------------------------------------------------------------------------
+# Watching a trained car drive (notebooks 04-07)
+# ------------------------------------------------------------------------------------------------------
+SHOWCASE_ROOM = 623600484   # a standard-test room: "move to the blue cylinder", hidden behind a long wall at the start
+
+
+def watch_drive(car, ppo=None, room=SHOWCASE_ROOM, name="drive", title="", live=False, force=False, prompt=None):
+    """Drive one room with a trained car in Genesis and show the video in the notebook.
+
+    The drive runs in its own process (scripts/watch_drive.py), like the tests: Genesis allows one simulator setup per
+    process, and the GPU memory is given back when it ends. The video is kept in runs/videos/ and reused unless
+    ``force``; ``live=True`` also opens the Genesis 3-D window (needs a screen) and always drives again."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    from IPython.display import Video
+    root = Path(__file__).resolve().parents[1]
+    out = root / "runs" / "videos" / f"{name}_room{room}.mp4"
+    if force or live or not out.exists():
+        cmd = [sys.executable, str(root / "scripts" / "watch_drive.py"), "--car", str(car), "--seed", str(room),
+               "--out", str(out), "--title", title]
+        cmd += ["--ppo", str(ppo)] if ppo else []
+        cmd += ["--live"] if live else []
+        cmd += ["--prompt", prompt] if prompt else []
+        r = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+        res = [l for l in r.stdout.splitlines() if l.startswith("RESULT")]
+        if not res:
+            raise RuntimeError(r.stdout[-2000:] + r.stderr[-2000:])
+        print(res[0][7:])
+    return Video(str(out), embed=True, width=960, html_attributes="controls loop autoplay muted")
