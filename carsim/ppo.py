@@ -78,6 +78,8 @@ class PPOConfig:
 
 
 class PPOTrainer:
+    venv_extra: dict = {}                # extra ParallelNav options for subclasses (notebook 06: poses=True)
+
     def __init__(self, cfg: PPOConfig, init_checkpoint, run_dir, prep_path, device: str | None = None):
         device = device or pick_device()
         self.cfg, self.device, self.run_dir = cfg, device, Path(run_dir)
@@ -98,11 +100,18 @@ class PPOTrainer:
         ds = NavChunkDataset(table, frames, eps, prep["split"]["train"], self.scaler, chunk=policy.config.chunk_size,
                              mirror_p=cfg.bc_mirror_p, paraphrase=True)
         collate = lambda items: {"image": torch.stack([s["image"] for s in items]), "state": torch.stack([s["state"] for s in items]),
-                                 "action": torch.stack([s["action"] for s in items]), "task": [s["task"] for s in items]}
+                                 "action": torch.stack([s["action"] for s in items]), "task": [s["task"] for s in items],
+                                 "frame": [s["frame"] for s in items]}
         self._bc_loader = torch.utils.data.DataLoader(ds, batch_size=cfg.bc_batch, shuffle=True, num_workers=2, collate_fn=collate,
                                                       worker_init_fn=ds.worker_init, persistent_workers=True, drop_last=True)
         self._bc_iter = iter(self._bc_loader)
-        self.venv = ParallelNav(cfg.n_envs, seed=cfg.seed, reward_cfg=cfg.reward, gamma=cfg.gamma, layout=cfg.practice_layout)
+        # held-out demo drives (the validation layouts): "does practice make the car forget the demos?" = the RL run's
+        # validation loss, measured every eval_every rounds with fixed noise so the numbers are comparable
+        self._val_ds = NavChunkDataset(table, frames, eps, prep["split"]["val"], self.scaler, chunk=policy.config.chunk_size,
+                                       mirror_p=0.0, paraphrase=False)
+        self._collate = collate
+        self.venv = ParallelNav(cfg.n_envs, seed=cfg.seed, reward_cfg=cfg.reward, gamma=cfg.gamma, layout=cfg.practice_layout,
+                                **self.venv_extra)
         self.obs = self.venv.reset()
         self.round = 0
         self.log: list[dict] = []           # one entry per round
@@ -127,24 +136,29 @@ class PPOTrainer:
     def collect(self):
         """Run every simulator for ``decisions_per_round`` decisions with the jittered policy."""
         c, T, N = self.cfg, self.cfg.decisions_per_round, self.cfg.n_envs
-        buf = {k: [] for k in ("images", "states", "prompts", "chain", "logp", "value", "reward", "n", "done", "trunc", "boot")}
+        buf = {k: [] for k in ("images", "states", "prompts", "chain", "logp", "value", "reward", "n", "done", "trunc", "boot", "help")}
         imgs, states, prompts = self.obs
         for _ in range(T):
+            h = self.help_step()                 # notebook 06: this decision's help (None = no help in this trainer)
+            self.use_help(h)
             a = self.rl.act(imgs, prompts, states, stochastic=True)
             out = self.venv.step(a["actions"])
+            self.help_after_step(out)
             boot = np.zeros(N, np.float32)
             tr = out["truncated"]
             if tr.any():  # hit the 60 s limit: the future still had value, so ask the critic about the last view
                 idx = np.flatnonzero(tr)
+                self.use_help(h, idx)
                 # (out["prompts"] already belongs to the NEXT episode after the auto-reset -> use this episode's prompt)
                 boot[idx] = self.rl.value(out["final_images"][idx], [prompts[i] for i in idx], out["final_states"][idx]).numpy()
             for k, v in [("images", imgs), ("states", states), ("prompts", prompts), ("chain", a["chain"]), ("logp", a["logp"]),
                          ("value", a["value"]), ("reward", out["reward"]), ("n", out["n"]), ("done", out["done"]),
-                         ("trunc", tr), ("boot", boot)]:
+                         ("trunc", tr), ("boot", boot), ("help", h)]:
                 buf[k].append(v)
             self.episodes += [dict(e, round=self.round) for e in out["episodes"] if e is not None]
             imgs, states, prompts = out["images"], out["states"], out["prompts"]
         self.obs = (imgs, states, prompts)
+        self.use_help(self.help_step(peek=True))
         last_v = self.rl.value(imgs, prompts, states).numpy()
         return buf, last_v
 
@@ -172,6 +186,7 @@ class PPOTrainer:
         flat = lambda x: [y for row in x for y in row]
         images = np.concatenate(buf["images"]); states = np.concatenate(buf["states"]); prompts = flat(buf["prompts"])
         chain = torch.cat(buf["chain"]); old_logp = torch.cat(buf["logp"])
+        helps = self.stack_help(buf["help"])
         adv_t = torch.as_tensor(adv.reshape(-1)); ret_t = torch.as_tensor(ret.reshape(-1))
         adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
         warm = self.round < c.critic_warmup_rounds
@@ -190,6 +205,7 @@ class PPOTrainer:
                     idx = idx_all[j:j + c.micro_batch]
                     w = len(idx) / len(idx_all)
                     R = ret_t[idx].to(self.device)
+                    self.use_help(helps, idx)
                     if warm:  # critic only: no need to re-score the action chains
                         value = self.rl.value_train(images[idx], [prompts[q] for q in idx], states[idx])
                         v_loss = 0.5 * ((value - R) ** 2).mean()
@@ -209,6 +225,7 @@ class PPOTrainer:
                     pgs.append(pg.item()); vls.append(v_loss.item())
                 if not warm:
                     b = self._bc_batch()  # separate backward = lower peak memory (gradients add up)
+                    self.use_bc_help(b)
                     bc = self.rl.bc_loss(b["image"], b["task"], b["state"], b["action"])
                     (bc_coef * bc).backward()
                     bcs.append(bc.item())
@@ -251,6 +268,8 @@ class PPOTrainer:
                  "reward_parts_last100": {k: float(np.mean([e["parts"][k] for e in last100])) for k in last100[0]["parts"]} if last100 else None,
                  "sigma": self.rl.sigma().detach().cpu().numpy().round(4).tolist(),
                  "collect_s": round(t1 - t0, 1), "learn_s": round(time.time() - t1, 1), **stats}
+        if self.round % self.cfg.eval_every == 0:
+            entry["val_demo_loss"] = self.val_demo_loss()
         self.after_round(entry)             # hook for subclasses (e.g. the curriculum's level-up)
         self.log.append(entry)
         self.round += 1
@@ -266,6 +285,41 @@ class PPOTrainer:
     def after_round(self, entry: dict):
         pass
 
+    @torch.no_grad()
+    def val_demo_loss(self, n_batches: int = 12, batch: int = 16) -> float:
+        """Imitation (flow-matching) loss on the VALIDATION demo drives: the same frames and the same noise every time."""
+        idx = np.random.default_rng(0).choice(len(self._val_ds), n_batches * batch, replace=False)
+        losses = []
+        with torch.random.fork_rng(devices=[self.device] if str(self.device).startswith("cuda") else []):
+            torch.manual_seed(0)
+            for k in range(n_batches):
+                b = self._collate([self._val_ds[int(i)] for i in idx[k * batch:(k + 1) * batch]])
+                self.use_bc_help(b, val=True)
+                losses.append(self.rl.bc_loss(b["image"], b["task"], b["state"], b["action"]).item())
+        self.rl.m._guidance = None
+        return float(np.mean(losses))
+
+    # ---- notebook 06 hooks: help from the overhead server (no-ops here; see carsim/guided_ppo.py) ----
+    def help_step(self, peek: bool = False, eval_mode: bool = False):
+        """The help for the current decision of every simulator (None = this trainer gives no help)."""
+        return None
+
+    def help_after_step(self, out):
+        pass
+
+    def use_help(self, h, idx=None):
+        """Put help h (or its rows idx) into the car's input for the next policy call."""
+        pass
+
+    def stack_help(self, hs):
+        return None
+
+    def use_bc_help(self, b, val: bool = False):
+        pass
+
+    def help_eval_start(self):
+        pass
+
     def extra_evals(self):
         pass
 
@@ -279,9 +333,12 @@ class PPOTrainer:
         self.venv.reseed(self.cfg.eval_seed if seed is None else seed, layout=layout or {})
         imgs, states, prompts = self.venv.reset()
         per_env = [[] for _ in range(self.cfg.n_envs)]
+        self.help_eval_start()
         while min(len(p) for p in per_env) < k:
+            self.use_help(self.help_step(eval_mode=True))
             a = self.rl.act(imgs, prompts, states, stochastic=False)
             out = self.venv.step(a["actions"])
+            self.help_after_step(out)
             for i, e in enumerate(out["episodes"]):
                 if e is not None and len(per_env[i]) < k:
                     per_env[i].append(e)
@@ -369,5 +426,45 @@ def plot_progress(trainer, fig=None):
     ax[5].set_title("Jitter size sigma (exploration)"); ax[5].legend(fontsize=8)
     for a in ax:
         a.set_xlabel("round"); a.grid(alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def plot_health(trainer, target_kl: float = 0.05, fig=None):
+    """Training-health graphs (losses and update sizes), next to plot_progress's results graphs.
+    trainer: a PPOTrainer, or anything with .log (one dict per round)."""
+    import matplotlib.pyplot as plt
+
+    log = trainer.log
+    r = np.array([e["round"] for e in log])
+    get = lambda k: np.array([e.get(k) if e.get(k) is not None else np.nan for e in log], float)
+    fig = fig or plt.figure(figsize=(15, 8))
+    fig.clf()
+    ax = fig.subplots(2, 3).ravel()
+    ax[0].plot(r, get("policy_loss"), lw=0.8)
+    ax[0].axhline(0, color="grey", lw=0.6)
+    ax[0].set_title("PPO policy loss (per round)\nnoisy around 0 is normal; it is not a progress meter")
+    ax[1].plot(r, get("value_loss"), lw=0.8, label="critic loss (left)")
+    ax[1].set_yscale("log"); ax[1].set_title("Critic: loss and accuracy")
+    b = ax[1].twinx(); b.plot(r, get("explained_variance"), color="C1", lw=0.8, label="explained variance (right)")
+    b.set_ylim(-1, 1); b.grid(False)
+    ax[1].legend(loc="upper left", fontsize=8); b.legend(loc="upper right", fontsize=8)
+    ax[2].plot(r, get("bc_loss"), lw=0.8, label="training demos (each round)")
+    v = get("val_demo_loss"); m = ~np.isnan(v)
+    if m.any():
+        ax[2].plot(r[m], v[m], "o-", color="C3", label="VALIDATION demos (fixed set)")
+    ax[2].set_title("Demo (imitation) loss: train vs validation\nrising validation = forgetting the demos"); ax[2].legend(fontsize=8)
+    ax[3].plot(r, get("kl"), lw=0.8, label="KL per round")
+    ax[3].axhline(target_kl, color="red", ls="--", lw=0.8, label=f"KL guard ({target_kl})")
+    es = np.array([bool(e.get("early_stop")) for e in log])
+    ax[3].plot(r[es], get("kl")[es], "x", color="red", ms=4, label="guard stopped the round early")
+    ax[3].set_title("How far each update moved the policy (KL)"); ax[3].legend(fontsize=8)
+    ax[4].plot(r, get("clip_frac"), lw=0.8, label="fraction clipped")
+    ax[4].plot(r, get("study_done"), lw=0.8, ls=":", label="share of study done")
+    ax[4].set_ylim(0, 1.05); ax[4].set_title("Clipping and how much learning each round did"); ax[4].legend(fontsize=8)
+    ax[5].plot(r, get("bc_coef"), lw=0.8, label="demo lesson weight")
+    ax[5].set_title("Demo lesson weight (fades over 100 rounds)"); ax[5].legend(fontsize=8)
+    for a in ax:
+        a.set_xlabel("round")
     fig.tight_layout()
     return fig

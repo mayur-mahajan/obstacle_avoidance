@@ -22,8 +22,11 @@ Run them in order; each one saves what the next one needs into `runs/`.
 | 03 | `03_preparing_training_data` | split by layout, action chunks, scaling, mirroring (and when not to), prompt paraphrases, the data loader | 10 min |
 | 04 | `04_imitation_training` | how a VLA works (reader + flow-matching action head), feeding the reader correctly, an auxiliary quiz, training **two action heads** (smolVLA's and a car-specific one), driving tests with charts and luck ranges | 2 h |
 | 05 | `05_reinforcement_learning_ppo` | reward design, parallel CPU simulators, making a flow-matching head trainable by PPO, reading RL graphs, comparing RL with imitation | 4 h |
+| 06 | `06_overhead_camera_guidance` | a ceiling camera read by an off-car server (SmolVLM2): extra input tokens for the car, testing whether help is used, why direction help fails and route help works, a learned obstacle map, marker tracking, a route planner | ~1 day* |
+| 07 | `07_route_guided_rl_ppo` | notebook 05's practice (PPO) for the route-guided car, with the real server in the practice loop (planning once per drive, tracking every half second), training-health charts (KL, train vs validation demo loss) | 4–8 h |
 
-\*On an RTX 4080 SUPER (16 GB) with a 20-core CPU. On an Apple Silicon Mac, notebooks 00–03 are fine; training in
+\*On an RTX 4080 SUPER (16 GB) with a 20-core CPU. Notebook 06 from scratch takes about a day (mostly the server's
+practice pictures and training); every long step is a script that is skipped when its results exist. On an Apple Silicon Mac, notebooks 00–03 are fine; training in
 04–05 runs but is several times slower.
 
 ## Results (imitation, notebook 04)
@@ -61,6 +64,40 @@ off), without hurting the reading. Success didn't rise because the failures move
 more often loses sight of the goal and doesn't find it again. With one camera picture at a time it has no memory of
 where the goal was; that is the next limit (notebook 05, section 9.5).
 
+## Results (ceiling camera, notebook 06)
+
+An off-car server reads a ceiling camera and sends the car 9 numbers every half second; same 128 test rooms (seed 0):
+
+| | front camera only | perfect direction to the goal | **real route from the server** | perfect route |
+|---|---|---|---|---|
+| success | 75% | 77% | **91%** | 99% |
+| ... goal hidden at the start | 69% | 63% | **88%** | 100% |
+| ... a box in the way (20 rooms) | 50% | 50% | **80%** | 95% |
+| drives that touched something | 52% | 46% | **30%** | 4% |
+
+Real route vs front camera, drive by drive: 29 rooms won, 9 lost (p = 0.002). Training the server's obstacle map
+longer (notebook 06, section 8.7) raised the real-route car to 94% (90% with a box in the way, 22% touching), 28 rooms
+won and 4 lost against the front camera; its gain over 91% is not yet beyond luck. Direction help (even perfect) points the
+car straight into whatever is in the way; a route goes around it. The working server uses the VLM for *what* (which
+object, what is an obstacle) and simple geometry for *where* (marker tracking of the car, colour for the goal, a
+shortest-path planner).
+
+## Results (practice with route help, notebook 07)
+
+140 rounds of notebook 05's PPO for the route car of notebook 06 (better map), same 128 test rooms:
+
+| | before practice | **after practice** | perfect route |
+|---|---|---|---|
+| success | 94% | **98%** | 99% |
+| ... goal hidden at the start | 92% | **96%** | 100% |
+| failed drives (stuck) | 8 (7) | **3 (3)** | 1 (1) |
+| seconds touching per drive | 3.0 | **1.6** | |
+| with help switched off | 67% | **76%** | 58% |
+
+Room by room the gain over "before" is not yet beyond luck (7 won, 2 lost, p = 0.18), but the car is now within luck of
+the perfect route (1 won, 3 lost) and far ahead of the front-camera car (29 won, 0 lost). Practice teaches *how to get
+unstuck*, the route says *where to go*: notebook 05 had only the first, notebook 06 only the second.
+
 ## Install
 
 Requirements: Python 3.12, [uv](https://docs.astral.sh/uv/), about 15 GB of free disk space (frame caches ~7 GB,
@@ -93,9 +130,15 @@ carsim/            the project code, imported by the notebooks (each file starts
   vla.py bc_train.py                     smolVLA loading, the reader input format, the car head; imitation training
   rl_env.py rl_policy.py ppo.py          reward, parallel simulators, PPO with a flow-matching head
   evaluate.py device.py teleop.py        test charts and statistics; device selection; keyboard driving
+  overhead.py server_native.py server_map.py   notebook 06: the ceiling camera, the SmolVLM2 server, the learned obstacle map
+  guidance.py guided_train.py route.py tracker.py nb06.py   help tokens for the car, route planning, marker tracking, charts
+  route_ppo.py      notebook 07: PPO with the real server's route help in the practice loop
 scripts/           programs the notebooks start in their own process (driving windows, recorder, tests)
   drive_empty_arena.py teleop.py record.py prompt_dialog.py   driving and recording
   rl_tests.py rl_reward_check.py train_bc.py                   driving tests, reward check, training from the command line
+  overhead_data*.py train_server*.py overhead_frames.py route_frames.py track_frames.py server_route_frames.py
+  train_guided.py car06_tests.py route_follow_prep.py           notebook 06's pipeline (each step skipped if done)
+  train_guided_ppo.py                                           practice runs from the command line (notebook 07: --route)
 assets/            the car model (URDF) and the 300 scripted room layouts (seeds) behind the results
 notebooks/         the course
 runs/              everything the notebooks produce (datasets, caches, checkpoints, test results); not in git
@@ -116,6 +159,14 @@ runs/              everything the notebooks produce (datasets, caches, checkpoin
 5. **RL fixes what demonstrations can't show, and reveals what's hidden behind it.** Practice with a crash cost taught
    the car to get off obstacles; that uncovered the next weakness (losing the goal), which a small reward alone did not fix.
 
+6. **Ask what kind of help the driver needs.** The perfect direction to a hidden goal didn't raise success; the same
+   9 numbers as a route around the obstacles did (75% → 91% with the real server, 99% with a perfect map).
+7. **VLMs for *what*, geometry for *where*.** SmolVLM2 locates things only to ~0.5 m (one picture token covers more
+   than half a metre of floor) and reads the car's heading backwards ~4% of the time; marker tracking gets 1 cm.
+
+8. **Practice and guidance do different jobs.** Practice (RL) taught getting unstuck; the route taught where to go.
+   Each alone left the car at 75–94%; together, 98%.
+
 ## References
 
 * smolVLA: Shukor et al. 2025, *SmolVLA: A Vision-Language-Action Model for Affordable and Efficient Robotics*, arXiv 2506.01844
@@ -123,3 +174,7 @@ runs/              everything the notebooks produce (datasets, caches, checkpoin
 * ReinFlow (PPO for flow policies): Zhang et al. 2025 · PPO: Schulman et al. 2017 · GAE: Schulman et al. 2016
 * Data scaling in imitation learning: Lin et al. 2024, arXiv 2410.18647 · DAgger / compounding errors: Ross et al. 2011
 * Language use in VLAs: LIBERO-Plus (arXiv 2510.13626), LangGap (arXiv 2603.00592)
+* Notebook 06: SmolVLM2 / SmolVLM (arXiv 2504.05299) · Mobility VLA (arXiv 2407.07775) · HAMSTER (arXiv 2502.05485) ·
+  RT-Trajectory (arXiv 2311.01977) · ODG-NoMaD (arXiv 2608.21395) · CoFL (arXiv 2603.02854) · A Good Time to Ask
+  (arXiv 2206.10606) · Ask4Help (arXiv 2211.09960) · VLMs are blind (arXiv 2407.06581) · grounding-aware token pruning
+  (arXiv 2506.21873) · the Robotarium (arXiv 1609.04730)

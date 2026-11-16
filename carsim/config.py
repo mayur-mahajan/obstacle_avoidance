@@ -27,6 +27,11 @@ class CarConfig:
     cam_pitch_deg: float = 10.0  # tilted down a little so the floor ahead is visible
     cam_fov_deg: float = 75.0  # vertical field of view
     cam_res: tuple = (256, 256)  # (width, height) in pixels
+    # ---- Roof marker (notebook 06) -----------------------------------------------------------------
+    roof_marker: bool = False  # cyan arrow on the roof so an overhead camera sees the heading; front camera can't see it
+    # colour of the arrow's FRONT chevron; None = cyan like the rest (first design). Two colours (2026-11-14): the overhead
+    # server read the all-cyan arrow BACKWARDS in ~6% of pictures; a hot-pink front makes front and back unmistakable.
+    roof_marker_front: tuple | None = None
     # ---- Velocity limits (what the "motors" can do) -----------------------------------------------
     max_vx: float = 0.8  # m/s forward/backward
     max_vy: float = 0.6  # m/s sideways (strafing)

@@ -46,7 +46,8 @@ class MecanumCar:
         self.cfg = cfg or CarConfig()
         self.sim_cfg = sim_cfg or SimConfig()
         self.scene = scene
-        urdf = build_urdf(self.cfg, ASSET_DIR / "mecanum_car.urdf")
+        name = ("mecanum_car_marker2.urdf" if self.cfg.roof_marker_front else "mecanum_car_marker.urdf") if self.cfg.roof_marker else "mecanum_car.urdf"
+        urdf = build_urdf(self.cfg, ASSET_DIR / name)
         self.entity = scene.add_entity(gs.morphs.URDF(file=str(urdf), fixed=True))
         self.fpv = scene.add_camera(
             res=self.cfg.cam_res, fov=self.cfg.cam_fov_deg, near=0.02, far=30.0, GUI=False

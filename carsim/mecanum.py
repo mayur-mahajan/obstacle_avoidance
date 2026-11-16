@@ -135,6 +135,23 @@ def build_urdf(cfg: CarConfig, out_path: str | Path) -> Path:
         f'<geometry><box size="0.03 0.05 0.03"/></geometry>'
         f'<material name="mast"><color rgba="0.1 0.1 0.1 1"/></material></visual>',
     ]
+    if cfg.roof_marker:
+        # Notebook 06: a big cyan arrow on the roof, pointing forward, so an OVERHEAD camera can see where the car
+        # faces (the 2 cm bumper is invisible from 8 m up). Cyan is no goal, obstacle, floor or wall colour, and it
+        # also stops the blue body looking like a "blue" goal from above. It sits behind the camera mast, so the
+        # car's own front camera never sees it. Shaft along the body + a chevron (two bars at +-45 deg) at the front.
+        z, cyan = H / 2 + 0.003, '<material name="marker"><color rgba="0.0 0.95 0.95 1"/></material>'
+        fr = cfg.roof_marker_front
+        front = cyan if fr is None else f'<material name="marker_front"><color rgba="{fr[0]} {fr[1]} {fr[2]} 1"/></material>'
+        tip, arm = 0.12, 0.15                      # chevron tip (m ahead of the centre) and arm length
+        d = arm / 2 * math.cos(math.pi / 4)        # arm centre offset from the tip, along x and y
+        chassis_vis += [
+            f'<visual><origin xyz="{-0.05:.4f} 0 {z:.4f}"/><geometry><box size="0.26 0.07 0.006"/></geometry>{cyan}</visual>',
+            f'<visual><origin xyz="{tip - d:.4f} {d:.4f} {z:.4f}" rpy="0 0 {-math.pi / 4:.4f}"/>'
+            f'<geometry><box size="{arm} 0.05 0.006"/></geometry>{front}</visual>',
+            f'<visual><origin xyz="{tip - d:.4f} {-d:.4f} {z:.4f}" rpy="0 0 {math.pi / 4:.4f}"/>'
+            f'<geometry><box size="{arm} 0.05 0.006"/></geometry>{front}</visual>',
+        ]
     # The collision box covers the wheels' footprint, so the car's "bumper" matches what you see.
     coll_L = 2 * (cfg.wheelbase_half + cfg.wheel_radius)
     coll_W = 2 * cfg.track_half + cfg.wheel_width

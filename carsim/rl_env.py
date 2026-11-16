@@ -98,13 +98,41 @@ def random_spec(rng: np.random.Generator, env_cfg=None):
 # -------------------------------------------------------------------------------------------------
 # One simulator per process
 # -------------------------------------------------------------------------------------------------
-def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, layout: dict, detail: bool = False):
+def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, layout: dict, detail: bool = False,
+            overhead_view: bool = False, poses: bool = False, route_view: bool = False):
     from .data import Paraphraser
     from .env import NavEnv
 
     from .curriculum import LEVEL_SECONDS, make_level_spec
+    from .route import route_facts
+    from .tracker import track
+    from .world import goal_in_view
 
-    env = NavEnv(backend="cpu")
+    if overhead_view or route_view:   # notebook 06: two-colour roof marker + the overhead camera (front camera unaffected)
+        from . import overhead
+        env = NavEnv(backend="cpu", car_cfg=overhead.car_config(two_colour=True), overview_camera_res=(1024, 1024))
+        jrng = np.random.default_rng(seed + 777)   # own stream: the layouts are the same as without the overhead view
+    else:
+        env = NavEnv(backend="cpu")
+
+    def with_view(o):
+        """Add the overhead picture, the car pose and the goal position to an observation (notebook 06 only)."""
+        if overhead_view:
+            j = overhead.sample_jitter(jrng)   # recorded: a calibrated ceiling camera knows its own mounting
+            o = dict(o, overhead=overhead.render(env, j), jitter=j.astype(np.float32))
+        if route_view:   # notebook 07: track the car in every overhead picture; send the picture itself only at a drive's start
+            j = overhead.sample_jitter(jrng)
+            pic = overhead.render(env, j)
+            t = track(pic, j)
+            o = dict(o, tracked=np.array([t["x"], t["y"], t["yaw"], float(t["ok"])], np.float32))
+            if state.get("fresh"):
+                o.update(fresh_pic=pic, fresh_jitter=j.astype(np.float32))
+                state["fresh"] = False
+        if overhead_view or poses:   # poses only: for simulated server help (no picture rendered)
+            o = dict(o, pose=np.asarray(env.car.pose(), np.float32), goal_xy=np.asarray(env.spec.goal[2:4], np.float32),
+                     goal_visible=bool(goal_in_view(env.cfg, env.grid, env._occ_no_goal, env.car.pose(), env.spec.goal[2:4])),
+                     route=route_facts(env.grid, env.spec.dist_field, env.car.pose(), env.spec.goal[2:4]))
+        return o
     base_cfg = env.cfg
     # layout: changes to the layout dials for these drives, e.g. {"p_goal_visible": 0.25}; {} = standard layouts.
     # A "levels" entry ({level name: probability}) switches to curriculum layouts (carsim/curriculum.py).
@@ -129,7 +157,9 @@ def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, l
             spec = random_spec(rng, layout_cfg)
             env.cfg = base_cfg
         state["level"] = level
+        state["fresh"] = True
         obs, info = env.reset(spec=spec)
+        obs = with_view(obs)
         shape, colour = spec.goal[:2]
         state.update(tracker=RewardTracker(env, info, rcfg), ret=0.0, path=[], coll=[], seen=bool(info["goal_visible"]),
                      prompt=para(colour, shape) if paraphrase else spec.prompt)
@@ -166,6 +196,7 @@ def _worker(conn, seed: int, reward_cfg: dict, gamma: float, paraphrase: bool, l
                     if detail:   # everything needed to draw the drive on the map (carsim.evaluate.plot_room_drives)
                         ep.update(path=state["path"], prompt=state["prompt"], collisions=state.get("coll", []))
                     break
+            obs = with_view(obs) if not done else obs
             final_obs = obs
             if done:
                 obs = new_episode()  # auto-reset: the next decision starts a fresh episode
@@ -198,7 +229,8 @@ class ParallelNav:
     """
 
     def __init__(self, n: int, seed: int = 0, reward_cfg: RewardConfig | None = None, gamma: float = 0.99,
-                 paraphrase: bool = True, layout: dict | None = None, detail: bool = False):
+                 paraphrase: bool = True, layout: dict | None = None, detail: bool = False, overhead_view: bool = False,
+                 poses: bool = False, route_view: bool = False):
         """layout: changes to the layout dials (EnvConfig fields) for practice drives, e.g.
         {"p_goal_visible": 0.25, "p_hard_distractor": 0.5}. None/{} = the standard layouts.
         detail: also return each finished drive's path (x, y, yaw every 0.1 s) and prompt (for the test maps)."""
@@ -206,7 +238,8 @@ class ParallelNav:
         self.conns, self.procs = [], []
         for i in range(n):
             a, b = ctx.Pipe()
-            p = ctx.Process(target=_worker, args=(b, seed * 1000 + i, asdict(reward_cfg or RewardConfig()), gamma, paraphrase, dict(layout or {}), detail),
+            p = ctx.Process(target=_worker, args=(b, seed * 1000 + i, asdict(reward_cfg or RewardConfig()), gamma, paraphrase, dict(layout or {}), detail,
+                                                  overhead_view, poses, route_view),
                             daemon=True)
             p.start()
             self.conns.append(a)
@@ -217,11 +250,22 @@ class ParallelNav:
     def _stack(obs_list):
         return (np.stack([o["image"] for o in obs_list]), np.stack([o["state"] for o in obs_list]).astype(np.float32))
 
+    @staticmethod
+    def views(obs_list):
+        """Notebook 06 (overhead_view=True): overhead pictures (N,1024,1024,3), car poses (N,3), goal positions (N,2)."""
+        out = {k: np.stack([o[k] for o in obs_list]) for k in ("overhead", "jitter", "pose", "goal_xy", "goal_visible", "route", "tracked")
+               if k in obs_list[0]}
+        if "tracked" in obs_list[0]:   # notebook 07: the overhead picture of simulators that just started a drive (else None)
+            out["fresh"] = [(o["fresh_pic"], o["fresh_jitter"]) if "fresh_pic" in o else None for o in obs_list]
+        return out
+
     def reset(self):
         for c in self.conns:
             c.send(("reset", None))
         res = [c.recv() for c in self.conns]
         imgs, states = self._stack([r[0] for r in res])
+        self.last_views = self.views([r[0] for r in res])
+        self.last_prompts = [r[1] for r in res]
         return imgs, states, [r[1] for r in res]
 
     def step(self, chunks):
@@ -230,6 +274,8 @@ class ParallelNav:
         res = [c.recv() for c in self.conns]
         imgs, states = self._stack([r[0] for r in res])
         f_imgs, f_states = self._stack([r[6] for r in res])
+        self.last_views = self.views([r[0] for r in res])
+        self.last_prompts = [r[1] for r in res]
         return {"images": imgs, "states": states, "prompts": [r[1] for r in res],
                 "reward": np.array([r[2] for r in res], np.float32), "n": np.array([r[3] for r in res]),
                 "done": np.array([r[4] for r in res]), "truncated": np.array([r[5] for r in res]),
