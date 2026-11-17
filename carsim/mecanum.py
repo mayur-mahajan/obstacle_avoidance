@@ -14,6 +14,7 @@ Two pieces live here:
 """
 
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -174,5 +175,9 @@ def build_urdf(cfg: CarConfig, out_path: str | Path) -> Path:
     parts.append("</robot>")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(parts))
+    # Parallel simulator workers all call this on the same file; write to a private temp file and rename it into place
+    # so that no worker ever reads a half-written URDF.
+    tmp = out_path.with_name(f"{out_path.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(parts))
+    os.replace(tmp, out_path)
     return out_path
