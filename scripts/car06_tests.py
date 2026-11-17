@@ -20,6 +20,7 @@ def main():
     import torch
     from carsim import overhead
     from carsim.config import CarConfig
+    from carsim.device import pick_device
     from carsim.data import ActionScaler
     from carsim.guidance import GuidanceAdapter, install
     from carsim.rl_env import ParallelNav
@@ -40,7 +41,7 @@ def main():
                     help="facts cars: where the help comes from (auto: true facts for C*, the live server otherwise)")
     a = ap.parse_args()
 
-    dev = "cuda"
+    dev = pick_device()
     rl = FlowRLPolicy(load_bc_policy(a.car, dev), ActionScaler.from_car(CarConfig()), 4, 5, device=dev, full_precision=True)
     if a.ppo:                                            # PPO-trained weights (action expert) on top of the car
         ck = torch.load(a.ppo, map_location="cpu", weights_only=False)
@@ -84,7 +85,7 @@ def main():
             x = torch.from_numpy(views["route"].astype(np.float32)).to(dev)
         elif real_route:
             s = server(views["overhead"], prompts)
-            with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+            with torch.no_grad(), torch.autocast("cuda", torch.bfloat16, enabled=str(dev).startswith("cuda")):
                 maps = (map_head(s["feats"]).float().sigmoid() > 0.5).cpu().numpy()
             fp = s["facts_pred"][:, :9].cpu().numpy()
             rows = []
